@@ -20,6 +20,7 @@ Not recommended depending on vllm for this file.
 import gc
 import logging
 import os
+from contextlib import nullcontext
 from multiprocessing import shared_memory
 from typing import Callable, TypedDict
 
@@ -109,56 +110,98 @@ class BucketedWeightSender:
         """
         from verl.workers.rollout.utils import ensure_async_iterator
 
+        from .resync_breakdown import maybe_new
+
+        # Off unless VERL_RESYNC_BREAKDOWN=1; disabled costs one env lookup and
+        # leaves every code path below byte-identical in behaviour.
+        bd = maybe_new(bucket_size_mb=self.bucket_size_mb)
+        if bd is not None:
+            bd.start()
         try:
-            self._init_socket()
-            self._init_buffer()
+            if bd is None:
+                self._init_socket()
+                self._init_buffer()
+            else:
+                with bd.segment("s1_socket_init_s"):
+                    self._init_socket()
+                with bd.segment("s2_buffer_init_s"):
+                    self._init_buffer()
 
             # send bucket weights
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             # dtype = PrecisionType.to_dtype(self.config.dtype)
-            async for name, weight in ensure_async_iterator(weights):
-                # model parameters are in fp32 full precision
-                # (vermouth1992) we should not force cast weight here because some parameters
-                # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
-                # the rollout should automatically cast on demand. However, this would incur a higher weight
-                # transfer volume.
-                # weight = weight.to(dtype, non_blocking=True)
+            #
+            # NOTE(kanban t_9e8db24f): the loop is bracketed as ONE segment
+            # rather than timed per tensor. On a large MoE model this loop runs
+            # tens of thousands of iterations per sync (the packed MoE params
+            # are expanded to one tensor per expert upstream), so a clock read
+            # per iteration would materially perturb the very cost being
+            # measured. Per-tensor mean is recovered by difference in
+            # ResyncBreakdown.per_tensor_loop_s; only integer counters are
+            # touched inside the loop.
+            iter_ctx = bd.segment("s3_tensor_iter_s") if bd is not None else nullcontext()
+            with iter_ctx:
+                async for name, weight in ensure_async_iterator(weights):
+                    # model parameters are in fp32 full precision
+                    # (vermouth1992) we should not force cast weight here because some parameters
+                    # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
+                    # the rollout should automatically cast on demand. However, this would incur a higher weight
+                    # transfer volume.
+                    # weight = weight.to(dtype, non_blocking=True)
+                    if bd is not None:
+                        bd.count_tensor(weight.nbytes, weight.is_contiguous())
 
-                # fill the tensor bucket
-                if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
-                    get_torch_device().synchronize()
-                    self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                    self.socket.recv()
-                    bucket_meta = {}
-                    offset = 0
+                    # fill the tensor bucket
+                    if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
+                        flush_ctx = bd.segment("s4_bucket_flush_s") if bd is not None else nullcontext()
+                        with flush_ctx:
+                            get_torch_device().synchronize()
+                            self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                            self.socket.recv()
+                        if bd is not None:
+                            bd.count_bucket()
+                        bucket_meta = {}
+                        offset = 0
 
-                if offset + weight.nbytes > self.bucket_size:
-                    assert not self.use_shm, (
-                        f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-                        f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
+                    if offset + weight.nbytes > self.bucket_size:
+                        assert not self.use_shm, (
+                            f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
+                            f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
+                        )
+                        if bd is not None:
+                            bd.count_direct_large()
+                        self._direct_send_large_weight(name, weight)
+                        continue
+
+                    bucket_meta[name] = {
+                        "name": name,
+                        "shape": weight.shape,
+                        "dtype": weight.dtype,
+                        "offset": offset,
+                        "handle": None,
+                    }
+                    self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
+                        weight, non_blocking=True
                     )
-                    self._direct_send_large_weight(name, weight)
-                    continue
-
-                bucket_meta[name] = {
-                    "name": name,
-                    "shape": weight.shape,
-                    "dtype": weight.dtype,
-                    "offset": offset,
-                    "handle": None,
-                }
-                self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
-                    weight, non_blocking=True
-                )
-                offset += weight.nbytes
+                    offset += weight.nbytes
 
             # send the last bucket
-            get_torch_device().synchronize()
-            self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-            self.socket.recv()
+            final_ctx = bd.segment("s5_final_flush_s") if bd is not None else nullcontext()
+            with final_ctx:
+                get_torch_device().synchronize()
+                self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
+                self.socket.recv()
+            if bd is not None:
+                bd.count_bucket()
         finally:
-            self._cleanup()
+            if bd is None:
+                self._cleanup()
+            else:
+                with bd.segment("s6_cleanup_s"):
+                    self._cleanup()
+                bd.stop()
+                bd.emit()
 
     def _init_socket(self):
         """Initialize ZMQ REQ socket and bind."""
