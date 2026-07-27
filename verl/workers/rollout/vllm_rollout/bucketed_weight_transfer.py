@@ -108,9 +108,8 @@ class BucketedWeightSender:
         Args:
             weights: Generator or async iterator yielding (name, tensor) pairs
         """
+        from verl.utils.resync_breakdown import maybe_new
         from verl.workers.rollout.utils import ensure_async_iterator
-
-        from .resync_breakdown import maybe_new
 
         # Off unless VERL_RESYNC_BREAKDOWN=1; disabled costs one env lookup and
         # leaves every code path below byte-identical in behaviour.
@@ -132,59 +131,97 @@ class BucketedWeightSender:
             bucket_meta: dict[str, TensorMetadata] = {}
             # dtype = PrecisionType.to_dtype(self.config.dtype)
             #
-            # NOTE(kanban t_9e8db24f): the loop is bracketed as ONE segment
-            # rather than timed per tensor. On a large MoE model this loop runs
-            # tens of thousands of iterations per sync (the packed MoE params
-            # are expanded to one tensor per expert upstream), so a clock read
-            # per iteration would materially perturb the very cost being
-            # measured. Per-tensor mean is recovered by difference in
-            # ResyncBreakdown.per_tensor_loop_s; only integer counters are
-            # touched inside the loop.
-            iter_ctx = bd.segment("s3_tensor_iter_s") if bd is not None else nullcontext()
-            with iter_ctx:
-                async for name, weight in ensure_async_iterator(weights):
-                    # model parameters are in fp32 full precision
-                    # (vermouth1992) we should not force cast weight here because some parameters
-                    # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
-                    # the rollout should automatically cast on demand. However, this would incur a higher weight
-                    # transfer volume.
-                    # weight = weight.to(dtype, non_blocking=True)
-                    if bd is not None:
-                        bd.count_tensor(weight.nbytes, weight.is_contiguous())
+            # NOTE(kanban t_9e8db24f): the SOURCE PULL is timed separately from
+            # the bucket fill (s3a vs s3b), which is the whole point of this
+            # probe rather than an optional refinement.
+            #
+            # In production `weights` is not a cheap iterator: it is
+            # `bridge.export_hf_weights(self.module)`
+            # (verl/workers/engine/megatron/transformer_impl.py:826 @ 3a5d729d),
+            # so advancing it re-materialises each Megatron parameter in HF
+            # layout -- for a TP/PP/EP-sharded actor feeding a differently
+            # sharded rollout, that involves collectives per tensor. Bracketing
+            # the loop as one span would therefore lump "the actor gathered the
+            # weight" together with "we copied it into the bucket" and localise
+            # nothing.
+            #
+            # The split costs two clock reads per tensor. Measured on this
+            # host: 36,945 tensors -> +6.18 ms, i.e. 0.006% of the 102.60 s
+            # update_weights median (workspace clock-overhead.json). That is
+            # three orders of magnitude below the signal, so the split is taken
+            # unconditionally rather than hidden behind a second flag.
+            aiter = ensure_async_iterator(weights).__aiter__()
+            while True:
+                if bd is None:
+                    try:
+                        name, weight = await aiter.__anext__()
+                    except StopAsyncIteration:
+                        break
+                else:
+                    _t0 = bd.clock()
+                    try:
+                        name, weight = await aiter.__anext__()
+                    except StopAsyncIteration:
+                        # the final pull still costs whatever it costs
+                        bd.add("s3a_source_pull_s", bd.clock() - _t0)
+                        break
+                    bd.add("s3a_source_pull_s", bd.clock() - _t0)
+                    _t1 = bd.clock()
 
-                    # fill the tensor bucket
-                    if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
-                        flush_ctx = bd.segment("s4_bucket_flush_s") if bd is not None else nullcontext()
-                        with flush_ctx:
+                # model parameters are in fp32 full precision
+                # (vermouth1992) we should not force cast weight here because some parameters
+                # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
+                # the rollout should automatically cast on demand. However, this would incur a higher weight
+                # transfer volume.
+                # weight = weight.to(dtype, non_blocking=True)
+                if bd is not None:
+                    bd.count_tensor(weight.nbytes, weight.is_contiguous())
+
+                # fill the tensor bucket
+                if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
+                    if bd is None:
+                        get_torch_device().synchronize()
+                        self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                        self.socket.recv()
+                    else:
+                        # exclude the flush from s3b so the two never overlap
+                        bd.add("s3b_bucket_fill_s", bd.clock() - _t1)
+                        with bd.segment("s4_bucket_flush_s"):
                             get_torch_device().synchronize()
                             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                             self.socket.recv()
-                        if bd is not None:
-                            bd.count_bucket()
-                        bucket_meta = {}
-                        offset = 0
+                        bd.count_bucket()
+                        _t1 = bd.clock()
+                    bucket_meta = {}
+                    offset = 0
 
-                    if offset + weight.nbytes > self.bucket_size:
-                        assert not self.use_shm, (
-                            f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
-                            f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
-                        )
-                        if bd is not None:
-                            bd.count_direct_large()
-                        self._direct_send_large_weight(name, weight)
-                        continue
-
-                    bucket_meta[name] = {
-                        "name": name,
-                        "shape": weight.shape,
-                        "dtype": weight.dtype,
-                        "offset": offset,
-                        "handle": None,
-                    }
-                    self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
-                        weight, non_blocking=True
+                if offset + weight.nbytes > self.bucket_size:
+                    assert not self.use_shm, (
+                        f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
+                        f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
                     )
-                    offset += weight.nbytes
+                    if bd is not None:
+                        bd.count_direct_large()
+                        bd.add("s3b_bucket_fill_s", bd.clock() - _t1)
+                        with bd.segment("s7_direct_large_s"):
+                            self._direct_send_large_weight(name, weight)
+                    else:
+                        self._direct_send_large_weight(name, weight)
+                    continue
+
+                bucket_meta[name] = {
+                    "name": name,
+                    "shape": weight.shape,
+                    "dtype": weight.dtype,
+                    "offset": offset,
+                    "handle": None,
+                }
+                self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
+                    weight, non_blocking=True
+                )
+                offset += weight.nbytes
+                if bd is not None:
+                    bd.add("s3b_bucket_fill_s", bd.clock() - _t1)
 
             # send the last bucket
             final_ctx = bd.segment("s5_final_flush_s") if bd is not None else nullcontext()

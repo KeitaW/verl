@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
@@ -25,6 +26,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.import_utils import import_external_libs
 from verl.utils.ray_utils import auto_await
+from verl.utils.resync_breakdown import maybe_new_orchestration
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
@@ -400,32 +402,45 @@ class CheckpointEngineManager:
         self.actor_wg = actor_wg
         self.replicas = replicas
 
-    def build_process_group(self, rollout: RayWorkerGroup):
-        """Build process group for actor worker group and rollout replicas."""
+    def build_process_group(self, rollout: RayWorkerGroup, _ob=None):
+        """Build process group for actor worker group and rollout replicas.
+
+        Args:
+            rollout: temporary worker group spanning every rollout replica.
+            _ob: optional ``OrchestrationBreakdown`` (kanban t_9e8db24f). When
+                present, stage 4 is split into prepare / build_topology /
+                init_process_group so a slow process-group build cannot hide
+                inside the weight-transfer number. Defaults to ``None``, so the
+                elastic scale-up/down call sites are unchanged.
+        """
         actor_wg = self.actor_wg
 
         # 1. prepare all workers
-        metadata = ray.get(
-            actor_wg.execute_checkpoint_engine(["prepare"] * actor_wg.world_size)
-            + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
-        )
+        with _ob.segment("o4a_prepare_s") if _ob else nullcontext():
+            metadata = ray.get(
+                actor_wg.execute_checkpoint_engine(["prepare"] * actor_wg.world_size)
+                + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
+            )
 
         # 2. build communication topology between all workers
-        actor_wg_kwargs, rollout_kwargs = self.backend_cls.build_topology(
-            actor_wg.world_size, rollout.world_size, metadata
-        )
-        for k, v in actor_wg_kwargs.items():
-            assert len(v) == actor_wg.world_size, f"actor_wg_kwargs[{k}] must have length of {actor_wg.world_size}"
-        for k, v in rollout_kwargs.items():
-            assert len(v) == rollout.world_size, f"rollout_kwargs[{k}] must have length of {rollout.world_size}"
+        with _ob.segment("o4b_build_topology_s") if _ob else nullcontext():
+            actor_wg_kwargs, rollout_kwargs = self.backend_cls.build_topology(
+                actor_wg.world_size, rollout.world_size, metadata
+            )
+            for k, v in actor_wg_kwargs.items():
+                assert len(v) == actor_wg.world_size, f"actor_wg_kwargs[{k}] must have length of {actor_wg.world_size}"
+            for k, v in rollout_kwargs.items():
+                assert len(v) == rollout.world_size, f"rollout_kwargs[{k}] must have length of {rollout.world_size}"
 
-        actor_wg_kwargs["method"] = ["init_process_group"] * actor_wg.world_size
-        rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
+            actor_wg_kwargs["method"] = ["init_process_group"] * actor_wg.world_size
+            rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
 
         # 3. init process group between all workers
-        ray.get(
-            actor_wg.execute_checkpoint_engine(**actor_wg_kwargs) + rollout.execute_checkpoint_engine(**rollout_kwargs)
-        )
+        with _ob.segment("o4c_init_process_group_s") if _ob else nullcontext():
+            ray.get(
+                actor_wg.execute_checkpoint_engine(**actor_wg_kwargs)
+                + rollout.execute_checkpoint_engine(**rollout_kwargs)
+            )
 
     def add_replicas(self, replicas: list[RolloutReplica]):
         """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
@@ -495,27 +510,49 @@ class CheckpointEngineManager:
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
             return {}
 
+        # NOTE(kanban t_9e8db24f): this method is the body of the trainer's
+        # `marked_timer("update_weights")` (verl/trainer/ppo/ray_trainer.py:1690).
+        # Stage timings are the only way to attribute that wall number: the
+        # weight movement itself is stage 5, and stages 1-4 and 6-8 are
+        # request abort, worker-group construction, KV-cache free/restore,
+        # process-group build and generation resume. Off unless
+        # VERL_RESYNC_BREAKDOWN=1; ~12 clock reads per sync in this one driver
+        # process when on.
+        ob = maybe_new_orchestration(global_steps=global_steps, backend=self.backend)
+        if ob is not None:
+            ob.start()
+
         # 1. abort and save all unfinished requests for partial rollout
-        await self.abort_replicas()
+        with ob.segment("o1_abort_replicas_s") if ob else nullcontext():
+            await self.abort_replicas()
 
         # 2. create a temporay worker group for all replicas
-        workers = []
-        for replica in self.replicas:
-            workers.extend(replica.workers)
-        rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
+        with ob.segment("o2_worker_group_s") if ob else nullcontext():
+            workers = []
+            for replica in self.replicas:
+                workers.extend(replica.workers)
+            rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         actor_wg = self.actor_wg
 
         # 3. release kv_cache before weight sync (weights stay in place)
-        await self.release_kv_cache_replicas()
+        with ob.segment("o3_release_kv_cache_s") if ob else nullcontext():
+            await self.release_kv_cache_replicas()
 
         # 4. build process group
-        self.build_process_group(rollout)
+        self.build_process_group(rollout, _ob=ob)
 
         # 5. update weights of all workers
-        results = ray.get(
-            actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
-            + rollout.update_weights(global_steps=global_steps)
-        )
+        #
+        # This single ray.get is a FULL-FLEET BARRIER over actor ranks and
+        # rollout ranks together, so o5 is bounded below by the slowest rank,
+        # not by the average. Comparing it against the per-rank sender
+        # wall_total_s (RESYNC_BREAKDOWN lines) is what separates "the transfer
+        # is slow" from "one rank is late".
+        with ob.segment("o5_send_recv_barrier_s") if ob else nullcontext():
+            results = ray.get(
+                actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
+                + rollout.update_weights(global_steps=global_steps)
+            )
         # The sender workers return the engine's per-sync metrics (empty for
         # backends that don't track any); merge and hand them to the trainer.
         sync_metrics: dict = {}
@@ -524,16 +561,29 @@ class CheckpointEngineManager:
                 sync_metrics.update(result)
 
         # 6. finalize all workers
-        ray.get(
-            actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
-            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
-        )
+        with ob.segment("o6_finalize_s") if ob else nullcontext():
+            ray.get(
+                actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
+                + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+            )
 
         # 7. restore kv_cache after weight sync
-        await self.resume_kv_cache_replicas()
+        with ob.segment("o7_resume_kv_cache_s") if ob else nullcontext():
+            await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
-        await self.resume_generation_replicas()
+        with ob.segment("o8_resume_generation_s") if ob else nullcontext():
+            await self.resume_generation_replicas()
+
+        if ob is not None:
+            ob.stop()
+            ob.emit()
+            # Surface into the trainer's metrics dict as well, so the breakdown
+            # lands in metrics.jsonl next to timing_s/update_weights and does
+            # not depend on scraping driver stdout.
+            for k, v in ob.as_dict().items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    sync_metrics[f"resync_orch/{k}"] = v
 
         return sync_metrics
 
